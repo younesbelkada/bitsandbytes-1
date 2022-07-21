@@ -10,7 +10,16 @@ from typing import Tuple
 lib = ct.cdll.LoadLibrary(os.path.dirname(__file__) + '/libbitsandbytes.so')
 lib.get_context.restype = ct.c_void_p
 lib.get_cusparse.restype = ct.c_void_p
+
 name2qmap = {}
+
+def pre_call(device):
+    prev_device = torch.cuda.current_device()
+    torch.cuda.set_device(device)
+    return prev_device
+
+def post_call(prev_device):
+    torch.cuda.set_device(prev_device)
 
 def get_transform_func(dtype, orderA, orderOut, transpose=False):
     name = f'ctransform_{(8 if dtype == torch.int8 else 32)}_{orderA}_to_{orderOut}_{"t" if transpose else "n"}'
@@ -95,7 +104,7 @@ def nvidia_transform(A, to_order, from_order='row', out=None, transpose=False, s
         dim1 = ct.c_int32(shape[0]*shape[1])
         dim2 = ct.c_int32(shape[2])
 
-    ptr = CUBLAS_Context.get_instance().context
+    ptr = CUBLAS_Context.get_instance().context[A.device.index]
     ptrA = get_ptr(A)
     ptrOut = get_ptr(out)
     func(ptr, get_ptr(A), get_ptr(out), dim1, dim2)
@@ -153,7 +162,12 @@ class CUBLAS_Context(object):
         raise RuntimeError('Call get_instance() instead')
 
     def initialize(self):
-        self.context = ct.c_void_p(lib.get_context())
+        self.context = {}
+        #prev_device = torch.cuda.current_device()
+        #for i in range(torch.cuda.device_count()):
+        #    torch.cuda.set_device(torch.device('cuda', i))
+        #    self.context.append(ct.c_void_p(lib.get_context()))
+        #torch.cuda.set_device(prev_device)
 
     @classmethod
     def get_instance(cls):
@@ -161,6 +175,15 @@ class CUBLAS_Context(object):
             cls._instance = cls.__new__(cls)
             cls._instance.initialize()
         return cls._instance
+
+    def get_context(self, device):
+        if device.index not in self.context:
+            prev_device = torch.cuda.current_device()
+            torch.cuda.set_device(device)
+            self.context[device.index] = ct.c_void_p(lib.get_context())
+            torch.cuda.set_device(prev_device)
+        return self.context[device.index]
+
 
 class Cusparse_Context(object):
     _instance = None
@@ -782,7 +805,8 @@ def igemm(A: Tensor, B: Tensor, out: Tensor=None, transposed_A=False, transposed
         ldc = m
 
 
-    ptr = CUBLAS_Context.get_instance().context
+    #ptr = CUBLAS_Context.get_instance().context[A.device.index]
+    ptr = CUBLAS_Context.get_instance().get_context(A.device)
 
     # B^T @ A^T = C^T
     # [km, nk -> mn] 
@@ -856,7 +880,8 @@ def batched_igemm(A: Tensor, B: Tensor, out: Tensor=None, transposed_A=False, tr
     strideB = A.shape[1]*A.shape[2]
     strideC = A.shape[1]*B.shape[2]
 
-    ptr = CUBLAS_Context.get_instance().context
+    #ptr = CUBLAS_Context.get_instance().context[A.device.index]
+    ptr = CUBLAS_Context.get_instance().get_context(A.device)
 
     lib.cbatched_igemm(ptr, ct.c_bool(transposed_B), ct.c_bool(transposed_A), ct.c_int32(m), ct.c_int32(n), ct.c_int32(k),
                get_ptr(B), get_ptr(A), get_ptr(out), ct.c_int32(lda), ct.c_int32(ldb), ct.c_int32(ldc),
@@ -916,6 +941,8 @@ def igemmlt(A, B, SA, SB, out=None, Sout=None, row_scale=None, dtype=torch.int32
 
     if row_scale is not None: assert row_scale.numel() == out.shape[0]
     assert dimsB != 3, 'len(B.shape)==3 not supported'
+    assert A.device.type == 'cuda'
+    assert B.device.type == 'cuda'
     assert A.dtype == torch.int8
     assert B.dtype == torch.int8
     assert out.dtype == dtype
@@ -924,8 +951,11 @@ def igemmlt(A, B, SA, SB, out=None, Sout=None, row_scale=None, dtype=torch.int32
     assert Sout[1] == 'col32'
     assert shapeA[-1] == shapeB[-1], f'Matmullt only supports A @ B^T. Inner matrix dimensions do not match: A @ B = {shapeA} @ {shapeB}'
     formatB = SB[1]
+    prev_device = A.device
+    torch.cuda.set_device(A.device)
 
-    ptr = CUBLAS_Context.get_instance().context
+    #ptr = CUBLAS_Context.get_instance().context[A.device.index]
+    ptr = CUBLAS_Context.get_instance().get_context(A.device)
     ptrA = get_ptr(A)
     ptrB = get_ptr(B)
     ptrC = get_ptr(out)
@@ -947,20 +977,26 @@ def igemmlt(A, B, SA, SB, out=None, Sout=None, row_scale=None, dtype=torch.int32
     n = ct.c_int32(n)
     k = ct.c_int32(k)
 
+    has_error = 0
     if formatB == 'col_turing':
         if dtype == torch.int32:
-            lib.cigemmlt_turing_32(ptr, m, n, k, ptrA, ptrB, ptrC, ptrRowScale, lda, ldb, ldc)
+            has_error = lib.cigemmlt_turing_32(ptr, m, n, k, ptrA, ptrB, ptrC, ptrRowScale, lda, ldb, ldc)
         elif row_scale is None:
-            lib.cigemmlt_turing_8(ptr, m, n, k, ptrA, ptrB, ptrC, ptrRowScale, lda, ldb, ldc)
+            has_error = lib.cigemmlt_turing_8(ptr, m, n, k, ptrA, ptrB, ptrC, ptrRowScale, lda, ldb, ldc)
         else:
-            lib.cigemmlt_turing_8_rowscale(ptr, m, n, k, ptrA, ptrB, ptrC, ptrRowScale, lda, ldb, ldc)
+            has_error = lib.cigemmlt_turing_8_rowscale(ptr, m, n, k, ptrA, ptrB, ptrC, ptrRowScale, lda, ldb, ldc)
     elif formatB == 'col_ampere':
         if dtype == torch.int32:
-            lib.cigemmlt_ampere_32(ptr, m, n, k, ptrA, ptrB, ptrC, ptrRowScale, lda, ldb, ldc)
+            has_error = lib.cigemmlt_ampere_32(ptr, m, n, k, ptrA, ptrB, ptrC, ptrRowScale, lda, ldb, ldc)
         elif row_scale is None:
-            lib.cigemmlt_ampere_8(ptr, m, n, k, ptrA, ptrB, ptrC, ptrRowScale, lda, ldb, ldc)
+            has_error = lib.cigemmlt_ampere_8(ptr, m, n, k, ptrA, ptrB, ptrC, ptrRowScale, lda, ldb, ldc)
         else:
-            lib.cigemmlt_ampere_8_rowscale(ptr, m, n, k, ptrA, ptrB, ptrC, ptrRowScale, lda, ldb, ldc)
+            has_error = lib.cigemmlt_ampere_8_rowscale(ptr, m, n, k, ptrA, ptrB, ptrC, ptrRowScale, lda, ldb, ldc)
+
+    if has_error == 1:
+        raise Exception('cublasLt ran into an error!')
+
+    torch.cuda.set_device(prev_device)
 
 
     return out, Sout
@@ -1082,7 +1118,10 @@ def get_colrow_absmax(A, row_stats=None, col_stats=None, nnz_block_ptr=None, thr
     rows = ct.c_int32(rows)
     cols = ct.c_int32(cols)
 
+    prev_device = pre_call(A.device)
     lib.cget_col_row_stats(ptrA, ptrRowStats, ptrColStats, ptrNnzrows, ct.c_float(threshold), rows, cols)
+    post_call(prev_device)
+
 
     if threshold > 0.0:
         nnz_block_ptr.cumsum_(0)
@@ -1168,6 +1207,7 @@ def double_quant(A, col_stats=None, row_stats=None, out_col=None, out_row=None, 
     device = A.device
     assert A.dtype == torch.half
     assert device.type == 'cuda'
+    prev_device = pre_call(A.device)
 
     cols = A.shape[-1]
     if len(A.shape) == 3:
@@ -1206,6 +1246,7 @@ def double_quant(A, col_stats=None, row_stats=None, out_col=None, out_row=None, 
             lib.cdouble_rowcol_quant(ptrA, ptrRowStats, ptrColStats, ptrOutCol, ptrOutRow, None, None, None, None, ct.c_float(0.0), ct.c_int32(rows), ct.c_int32(cols))
     else:
         lib.cdouble_rowcol_quant(ptrA, ptrRowStats, ptrColStats, ptrOutCol, ptrOutRow, None, None, None, None, ct.c_float(threshold), ct.c_int32(rows), ct.c_int32(cols))
+    post_call(prev_device)
 
     return out_row, out_col, row_stats, col_stats, coo_tensor
 

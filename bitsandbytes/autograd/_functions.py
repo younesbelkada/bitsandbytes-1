@@ -172,6 +172,7 @@ class MatMul8bitLt(torch.autograd.Function):
         formatB = state.formatB
         input_shape = A.shape
         if state.outlier_pool is None: state.outlier_pool = GlobalOutlierPooler.get_instance()
+        assert A.dtype == torch.float16, f'The input data type needs to be fp16 but {A.dtype} was found!'
 
         # 1. Quantize A
         if len(A.shape) == 3: A = A.view(-1, A.shape[-1]).contiguous()
